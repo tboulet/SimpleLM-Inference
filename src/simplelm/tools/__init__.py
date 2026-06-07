@@ -33,6 +33,7 @@ from .parsers import (
     parse_kimi_k2,
     parse_minimax_m2,
     parse_noop,
+    parse_python_call,
     parse_qwen3_coder,
     parse_simple_call,
 )
@@ -47,6 +48,7 @@ _REGISTRY: dict[str, Callable] = {
     "minimax-m2": parse_minimax_m2,
     "deepseek-v4": parse_deepseek_v4,
     "simple_call": parse_simple_call,
+    "python_call": parse_python_call,
 }
 
 

@@ -236,6 +236,78 @@ def _parse_simple_args(body: str) -> dict:
     return args
 
 
+def parse_python_call(raw: str) -> tuple[str, list[dict]]:
+    """Permissive parser for ``function_name(arg=value, arg="value")`` syntax.
+
+    Observed on Qwen2.5-VL-7B-Instruct (and many other models) when
+    given an OpenAI tools schema: the model emits Python function-call
+    text. Values may be bare, double-quoted, or single-quoted.
+
+    Distinguishing from natural prose: we only match when the call
+    appears alone on a line or is the sole assistant content (i.e. the
+    regex enforces it sits at start-of-line or after specific
+    whitespace + the parenthesised args have at least one key=value
+    pair).
+    """
+    pat = re.compile(
+        r"(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*=[^()]*)\)\s*(?=$|\n)",
+        re.MULTILINE,
+    )
+    calls: list[dict] = []
+    leftover_parts: list[str] = []
+    last = 0
+    for m in pat.finditer(raw):
+        leftover_parts.append(raw[last:m.start()])
+        last = m.end()
+        name = m.group(1)
+        body = m.group(2)
+        args = _parse_python_args(body)
+        calls.append(_mk_call(name, args))
+    leftover_parts.append(raw[last:])
+    return "".join(leftover_parts).strip(), calls
+
+
+def _parse_python_args(body: str) -> dict:
+    """Parse ``key=value, key="value with space"`` into a dict."""
+    args: dict[str, str] = {}
+    i = 0
+    n = len(body)
+    while i < n:
+        while i < n and body[i] in " ,\t\n":
+            i += 1
+        key_start = i
+        while i < n and body[i] != "=":
+            i += 1
+        if i >= n:
+            break
+        key = body[key_start:i].strip()
+        i += 1  # skip '='
+        while i < n and body[i] in " \t":
+            i += 1
+        if i >= n:
+            args[key] = ""
+            break
+        if body[i] in ('"', "'"):
+            quote = body[i]
+            i += 1
+            val_start = i
+            while i < n and body[i] != quote:
+                if body[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                i += 1
+            value = body[val_start:i]
+            if i < n:
+                i += 1
+        else:
+            val_start = i
+            while i < n and body[i] != ",":
+                i += 1
+            value = body[val_start:i].strip()
+        args[key] = value
+    return args
+
+
 def parse_deepseek_v4(raw: str) -> tuple[str, list[dict]]:
     """DeepSeek V4 JSON block: ``<｜tool_calls_begin｜>[{...}]<｜tool_calls_end｜>``.
 

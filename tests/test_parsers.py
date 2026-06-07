@@ -132,6 +132,36 @@ def test_simple_call_quoted_value_with_comma():
     assert args == {"text": "hello, world"}
 
 
+def test_python_call_basic():
+    parse = get_parser("python_call")
+    raw = 'get_weather(location="Paris")'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"location": "Paris"}
+
+
+def test_python_call_multiple_args():
+    parse = get_parser("python_call")
+    raw = 'send_email(to="alice@example.com", subject="hi", body="hello there, friend")'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["to"] == "alice@example.com"
+    assert args["subject"] == "hi"
+    assert "hello there" in args["body"]
+
+
+def test_python_call_skip_inline_prose():
+    """A function-call-like substring in prose shouldn't be extracted."""
+    parse = get_parser("python_call")
+    raw = "I would say that get_weather(location='Paris') is a good idea."
+    content, calls = parse(raw)
+    # No newline boundaries → don't extract
+    assert calls == []
+    assert content == raw
+
+
 def test_simple_call_gameagents_alan_style():
     """The format GameAgents/Alan-Code seems to nudge models toward."""
     parse = get_parser("simple_call")
