@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simplelm"
+version = "0.0.1"
+description = "OpenAI-compatible LLM inference server on top of HuggingFace transformers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.45",
+    "accelerate>=0.30",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.0",
+    "pillow>=10.0",
+    "kernels<0.15",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx", "ruff", "mypy"]
+
+[project.scripts]
+simplelm = "simplelm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

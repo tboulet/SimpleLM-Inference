@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# venvs
+.venv/
+venv/
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# pytest / mypy / coverage
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# experiment artefacts
+logs/
+*.log
