@@ -6,14 +6,16 @@ Wraps a single `Backend` instance and exposes `/v1/models` +
 """
 from __future__ import annotations
 
+import json as json_module
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 
 from simplelm.backends.base import Backend
 from simplelm.schema import (
@@ -67,13 +69,6 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
         [t.model_dump(exclude_none=True) for t in req.tools] if req.tools else None
     )
 
-    if req.stream:
-        # Streaming not yet supported. Fail fast with a 400 so clients can
-        # fall back to non-streaming rather than silently hanging.
-        raise HTTPException(
-            400, "streaming is not implemented in this SimpleLM version"
-        )
-
     result = backend.generate(
         plain_msgs,
         max_new_tokens=int(req.max_tokens or 512),
@@ -93,8 +88,20 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
         message["tool_calls"] = tool_calls
         finish_reason = "tool_calls"
 
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    if req.stream:
+        # Pseudo-streaming: the backend is synchronous, so we just emit
+        # the full message as a single delta plus the [DONE] sentinel.
+        # Real token-by-token streaming would require backend hooks; for
+        # now this lets clients that hard-require stream=true work.
+        return StreamingResponse(
+            _stream_synthetic(completion_id, req.model, message, finish_reason),
+            media_type="text/event-stream",
+        )
+
     return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        id=completion_id,
         created=int(time.time()),
         model=req.model,
         choices=[ChatChoice(index=0, message=message, finish_reason=finish_reason)],
@@ -104,6 +111,37 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
             total_tokens=result.prompt_tokens + result.completion_tokens,
         ),
     )
+
+
+async def _stream_synthetic(
+    completion_id: str, model: str, message: dict, finish_reason: str
+) -> AsyncGenerator[str, None]:
+    """Emit the OpenAI streaming chunk format from a finished completion.
+
+    Two chunks: one carrying the full delta, one with `finish_reason`.
+    Clients that wait for `data: [DONE]` get it.
+    """
+    created = int(time.time())
+    delta = {"role": "assistant", "content": message.get("content")}
+    if "tool_calls" in message:
+        delta["tool_calls"] = message["tool_calls"]
+    chunk1 = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+    chunk2 = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+    yield f"data: {json_module.dumps(chunk1)}\n\n"
+    yield f"data: {json_module.dumps(chunk2)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 def serve(
