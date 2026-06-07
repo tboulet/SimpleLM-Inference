@@ -249,8 +249,10 @@ def parse_python_call(raw: str) -> tuple[str, list[dict]]:
     whitespace + the parenthesised args have at least one key=value
     pair).
     """
+    # Match `fn(...)` sitting on its own line. The body may be either
+    # `key=value, key=value` (keyword args) OR `value1, value2` (positional).
     pat = re.compile(
-        r"(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*=[^()]*)\)\s*(?=$|\n)",
+        r"(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*)\)\s*(?=$|\n)",
         re.MULTILINE,
     )
     calls: list[dict] = []
@@ -260,11 +262,45 @@ def parse_python_call(raw: str) -> tuple[str, list[dict]]:
         leftover_parts.append(raw[last:m.start()])
         last = m.end()
         name = m.group(1)
-        body = m.group(2)
-        args = _parse_python_args(body)
+        body = m.group(2).strip()
+        if not body:
+            args: dict | list = {}
+        elif "=" in body:
+            args = _parse_python_args(body)
+        else:
+            # All positional: split on top-level commas, strip quotes.
+            args = {"args": [_strip_quotes(p.strip()) for p in _split_top_commas(body)]}
         calls.append(_mk_call(name, args))
     leftover_parts.append(raw[last:])
     return "".join(leftover_parts).strip(), calls
+
+
+def _strip_quotes(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    return s
+
+
+def _split_top_commas(body: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    for ch in body:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+            cur.append(ch)
+        elif ch == ",":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur))
+    return parts
 
 
 def _parse_python_args(body: str) -> dict:

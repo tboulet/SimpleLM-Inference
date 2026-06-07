@@ -152,6 +152,26 @@ def test_python_call_multiple_args():
     assert "hello there" in args["body"]
 
 
+def test_python_call_positional():
+    """Positional args (no `=`) are stored under 'args' key."""
+    parse = get_parser("python_call")
+    raw = 'get_weather(Paris)'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"args": ["Paris"]}
+
+
+def test_python_call_zero_args():
+    parse = get_parser("python_call")
+    raw = "do_thing()"
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "do_thing"
+    assert json.loads(calls[0]["function"]["arguments"]) == {}
+
+
 def test_python_call_skip_inline_prose():
     """A function-call-like substring in prose shouldn't be extracted."""
     parse = get_parser("python_call")
