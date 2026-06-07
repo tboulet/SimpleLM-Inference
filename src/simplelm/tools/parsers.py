@@ -162,6 +162,80 @@ def parse_minimax_m2(raw: str) -> tuple[str, list[dict]]:
     return "".join(leftover_parts).strip(), calls
 
 
+def parse_simple_call(raw: str) -> tuple[str, list[dict]]:
+    """Permissive parser for ``call:FunctionName{key:value,key:value}`` style.
+
+    Many small / mid models emit Claude-imitating text like
+    ``call:get_weather{city:Paris}`` when given an OpenAI tools schema
+    without strong format steering. Values may be bare, quoted, or
+    contain commas inside strings. We do a best-effort parse and
+    fall back to keeping the raw block in `content` if structure is
+    unrecognisable.
+
+    Works for: gemma-4 (without `<|tool_call|>`), llama-3, mistral
+    family, smaller Qwen variants.
+    """
+    pat = re.compile(r"call\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{([^{}]*)\}")
+    calls: list[dict] = []
+    leftover_parts: list[str] = []
+    last = 0
+    for m in pat.finditer(raw):
+        leftover_parts.append(raw[last:m.start()])
+        last = m.end()
+        name = m.group(1)
+        body = m.group(2)
+        args = _parse_simple_args(body)
+        calls.append(_mk_call(name, args))
+    leftover_parts.append(raw[last:])
+    return "".join(leftover_parts).strip(), calls
+
+
+def _parse_simple_args(body: str) -> dict:
+    """Turn ``key1:value1,key2:value2`` into a dict, preserving commas
+    inside quoted strings. Bare values are kept as strings."""
+    args: dict[str, str] = {}
+    i = 0
+    n = len(body)
+    while i < n:
+        # skip whitespace + commas between entries
+        while i < n and body[i] in " ,\t\n":
+            i += 1
+        # key
+        key_start = i
+        while i < n and body[i] not in ":":
+            i += 1
+        if i >= n:
+            break
+        key = body[key_start:i].strip()
+        i += 1  # skip ':'
+        # value — may be quoted
+        while i < n and body[i] in " \t":
+            i += 1
+        if i >= n:
+            args[key] = ""
+            break
+        if body[i] in ('"', "'"):
+            quote = body[i]
+            i += 1
+            val_start = i
+            while i < n and body[i] != quote:
+                # honour simple backslash escapes
+                if body[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                i += 1
+            value = body[val_start:i]
+            if i < n:
+                i += 1  # skip closing quote
+        else:
+            val_start = i
+            while i < n and body[i] != ",":
+                i += 1
+            value = body[val_start:i].strip()
+        args[key] = value
+    return args
+
+
 def parse_deepseek_v4(raw: str) -> tuple[str, list[dict]]:
     """DeepSeek V4 JSON block: ``<｜tool_calls_begin｜>[{...}]<｜tool_calls_end｜>``.
 

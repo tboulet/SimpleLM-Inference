@@ -96,3 +96,49 @@ def test_no_match_returns_raw():
     content, calls = parse(raw)
     assert content == raw
     assert calls == []
+
+
+def test_simple_call_basic():
+    parse = get_parser("simple_call")
+    raw = "I'll check the weather. call:get_weather{city:Paris}"
+    content, calls = parse(raw)
+    assert "I'll check the weather" in content
+    assert "call:" not in content
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"city": "Paris"}
+
+
+def test_simple_call_multiple():
+    """Multiple sequential call:Name{...} blocks all extract."""
+    parse = get_parser("simple_call")
+    raw = "First call:foo{a:1} then call:bar{b:2,c:hello world}"
+    content, calls = parse(raw)
+    assert len(calls) == 2
+    assert calls[0]["function"]["name"] == "foo"
+    assert calls[1]["function"]["name"] == "bar"
+    args = json.loads(calls[1]["function"]["arguments"])
+    assert args == {"b": "2", "c": "hello world"}
+
+
+def test_simple_call_quoted_value_with_comma():
+    """Quoted values may contain commas."""
+    parse = get_parser("simple_call")
+    raw = 'call:say{text:"hello, world"}'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"text": "hello, world"}
+
+
+def test_simple_call_gameagents_alan_style():
+    """The format GameAgents/Alan-Code seems to nudge models toward."""
+    parse = get_parser("simple_call")
+    raw = "call:Bash{command:ls -R,purpose:Explore the working directory structure.}"
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "Bash"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["command"] == "ls -R"
+    assert "Explore" in args["purpose"]

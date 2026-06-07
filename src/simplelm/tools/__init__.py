@@ -34,6 +34,7 @@ from .parsers import (
     parse_minimax_m2,
     parse_noop,
     parse_qwen3_coder,
+    parse_simple_call,
 )
 
 
@@ -45,6 +46,7 @@ _REGISTRY: dict[str, Callable] = {
     "glm45": parse_glm45,
     "minimax-m2": parse_minimax_m2,
     "deepseek-v4": parse_deepseek_v4,
+    "simple_call": parse_simple_call,
 }
 
 
