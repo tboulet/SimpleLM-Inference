@@ -8,10 +8,65 @@ from __future__ import annotations
 import threading
 
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from simplelm.backends.base import Backend, GenerationResult
 from simplelm.vision import load_image
+
+
+def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_code):
+    """Try the right AutoModel for the given config.
+
+    `AutoModelForCausalLM` rejects vision-language models (Qwen2.5-VL,
+    Gemma3/4 multimodal, etc.). We probe several heads in order.
+    """
+    from transformers import AutoModelForCausalLM
+
+    # Pre-load the config so we can ask "is this multimodal?".
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    arch = (getattr(cfg, "architectures", None) or [""])[0] or ""
+    is_vlm = (
+        getattr(cfg, "vision_config", None) is not None
+        or "VL" in arch
+        or "Vision" in arch
+        or "Multi" in arch
+        or "ConditionalGeneration" in arch
+    )
+
+    # Try the VLM head first if config looks multimodal, else CausalLM
+    # first. Each branch falls through to others on failure.
+    candidates = []
+    if is_vlm:
+        # AutoModelForImageTextToText is the newest umbrella head.
+        try:
+            from transformers import AutoModelForImageTextToText
+            candidates.append(AutoModelForImageTextToText)
+        except ImportError:
+            pass
+        try:
+            from transformers import AutoModelForVision2Seq
+            candidates.append(AutoModelForVision2Seq)
+        except ImportError:
+            pass
+    candidates.append(AutoModelForCausalLM)
+
+    last_err: Exception | None = None
+    for cls in candidates:
+        try:
+            return cls.from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=trust_remote_code,
+            )
+        except ValueError as e:
+            # ValueError is what AutoModel raises when the config doesn't
+            # match. Keep trying other heads.
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"None of the AutoModel heads accept config arch={arch!r}. Last error: {last_err}"
+    )
 
 
 def _coerce_for_template(messages: list[dict]) -> tuple[list[dict], list]:
@@ -102,7 +157,7 @@ class HuggingFaceBackend:
                 model_path, trust_remote_code=trust_remote_code
             )
 
-        self._model = AutoModelForCausalLM.from_pretrained(
+        self._model = _load_model_auto(
             model_path,
             torch_dtype=self._dtype,
             device_map=device_map,
