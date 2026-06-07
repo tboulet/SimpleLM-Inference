@@ -182,6 +182,49 @@ def test_python_call_skip_inline_prose():
     assert content == raw
 
 
+def test_name_then_json_basic():
+    parse = get_parser("name_then_json")
+    raw = 'get_weather{"location": "Paris"}'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"location": "Paris"}
+
+
+def test_json_object_basic():
+    parse = get_parser("json_object")
+    raw = 'Sure, I will call {"name": "lookup", "arguments": {"q": "weather"}}'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "lookup"
+
+
+def test_universal_falls_through():
+    """universal tries each format until one matches."""
+    parse = get_parser("universal")
+    # name_then_json format
+    raw = 'get_weather{"location": "Paris"}'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+
+    # python_call format
+    raw = "set_volume(level=5)"
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "set_volume"
+
+    # simple_call format
+    raw = "call:fire{at:north}"
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "fire"
+
+    # no match
+    content, calls = parse("just normal prose with no calls")
+    assert calls == []
+
+
 def test_simple_call_gameagents_alan_style():
     """The format GameAgents/Alan-Code seems to nudge models toward."""
     parse = get_parser("simple_call")

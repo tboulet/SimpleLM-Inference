@@ -30,12 +30,15 @@ from .parsers import (
     parse_deepseek_v4,
     parse_gemma4,
     parse_glm45,
+    parse_json_object,
     parse_kimi_k2,
     parse_minimax_m2,
+    parse_name_then_json,
     parse_noop,
     parse_python_call,
     parse_qwen3_coder,
     parse_simple_call,
+    parse_universal,
 )
 
 
@@ -49,6 +52,9 @@ _REGISTRY: dict[str, Callable] = {
     "deepseek-v4": parse_deepseek_v4,
     "simple_call": parse_simple_call,
     "python_call": parse_python_call,
+    "name_then_json": parse_name_then_json,
+    "json_object": parse_json_object,
+    "universal": parse_universal,
 }
 
 

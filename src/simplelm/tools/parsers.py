@@ -344,6 +344,117 @@ def _parse_python_args(body: str) -> dict:
     return args
 
 
+def parse_name_then_json(raw: str) -> tuple[str, list[dict]]:
+    """``FunctionName{"arg": "value"}`` — name followed by a JSON object.
+
+    Observed on Qwen2.5-VL-7B-Instruct. Distinct from `simple_call` (no
+    `call:` prefix) and from `gemma4` (no `<|tool_call|>` wrapper).
+    """
+    pat = re.compile(
+        r"(?:^|\n|\s)([A-Za-z_][A-Za-z0-9_]*)\s*(\{[^{}]*\})",
+    )
+    calls: list[dict] = []
+    leftover_parts: list[str] = []
+    last = 0
+    for m in pat.finditer(raw):
+        # Skip if 'call:' precedes — that's simple_call's job.
+        prefix = raw[max(0, m.start() - 6):m.start() + 1]
+        if "call:" in prefix:
+            continue
+        name = m.group(1)
+        try:
+            args = json.loads(m.group(2))
+        except json.JSONDecodeError:
+            continue
+        leftover_parts.append(raw[last:m.start()])
+        last = m.end()
+        calls.append(_mk_call(name, args))
+    leftover_parts.append(raw[last:])
+    if not calls:
+        return raw, []
+    return "".join(leftover_parts).strip(), calls
+
+
+def parse_json_object(raw: str) -> tuple[str, list[dict]]:
+    """A bare JSON object ``{"name": "x", "arguments": {...}}`` (or a list).
+
+    Useful for models that emit OpenAI-shaped tool calls directly in
+    their response text. Uses brace-counting to handle nested objects
+    that regex alone can't.
+    """
+    calls: list[dict] = []
+    leftover_parts: list[str] = []
+    last = 0
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] == "{":
+            # Find the matching closing brace (depth-aware, quote-aware).
+            depth = 0
+            j = i
+            in_str: str | None = None
+            while j < n:
+                ch = raw[j]
+                if in_str:
+                    if ch == "\\" and j + 1 < n:
+                        j += 2
+                        continue
+                    if ch == in_str:
+                        in_str = None
+                elif ch in ('"', "'"):
+                    in_str = ch
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if depth == 0 and j < n:
+                candidate = raw[i:j + 1]
+                try:
+                    obj = json.loads(candidate)
+                except json.JSONDecodeError:
+                    i = j + 1
+                    continue
+                if isinstance(obj, dict) and obj.get("name"):
+                    args = obj.get("arguments") or obj.get("parameters") or {}
+                    leftover_parts.append(raw[last:i])
+                    last = j + 1
+                    calls.append(_mk_call(obj["name"], args))
+                i = j + 1
+                continue
+        i += 1
+    leftover_parts.append(raw[last:])
+    if not calls:
+        return raw, []
+    return "".join(leftover_parts).strip(), calls
+
+
+def parse_universal(raw: str) -> tuple[str, list[dict]]:
+    """Try every known parser in order; return the first that finds calls.
+
+    Useful as a default when you don't know which format the model
+    prefers (or when it varies between turns).
+    """
+    for fn in (
+        parse_gemma4,
+        parse_qwen3_coder,
+        parse_kimi_k2,
+        parse_glm45,
+        parse_minimax_m2,
+        parse_deepseek_v4,
+        parse_simple_call,
+        parse_name_then_json,
+        parse_python_call,
+        parse_json_object,
+    ):
+        content, calls = fn(raw)
+        if calls:
+            return content, calls
+    return raw, []
+
+
 def parse_deepseek_v4(raw: str) -> tuple[str, list[dict]]:
     """DeepSeek V4 JSON block: ``<｜tool_calls_begin｜>[{...}]<｜tool_calls_end｜>``.
 
