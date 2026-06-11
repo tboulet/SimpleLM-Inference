@@ -12,6 +12,7 @@ from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from simplelm.backends.base import Backend, GenerationResult
 from simplelm.vision import load_image
+from simplelm._logging import logger, warning_once
 
 
 def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_code):
@@ -32,6 +33,7 @@ def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_c
         or "Multi" in arch
         or "ConditionalGeneration" in arch
     )
+    logger.info("detected architecture %r (is_vlm=%s)", arch, is_vlm)
 
     # Try the VLM head first if config looks multimodal, else CausalLM
     # first. Each branch falls through to others on failure.
@@ -50,7 +52,7 @@ def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_c
             pass
     candidates.append(AutoModelForCausalLM)
 
-    last_err: Exception | None = None
+    errors : list[Exception] = []
     for cls in candidates:
         try:
             return cls.from_pretrained(
@@ -62,10 +64,14 @@ def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_c
         except ValueError as e:
             # ValueError is what AutoModel raises when the config doesn't
             # match. Keep trying other heads.
-            last_err = e
+            logger.info(
+                "AutoModel head %s rejected arch=%r: %s — trying next candidate",
+                cls.__name__, arch, e,
+            )
+            errors.append(e)
             continue
     raise RuntimeError(
-        f"None of the AutoModel heads accept config arch={arch!r}. Last error: {last_err}"
+        f"None of the AutoModel heads accept config arch={arch!r}. Errors: {'\n\n----------\n\n'.join(str(e) for e in errors)}"
     )
 
 
@@ -104,7 +110,7 @@ def _coerce_for_template(messages: list[dict]) -> tuple[list[dict], list]:
                 imgs.append(img)
                 parts.append({"type": "image"})
             else:
-                # silently drop unknown types — future extensibility
+                warning_once("dropping unsupported content part type %r", t)
                 continue
         out_msgs.append({"role": role, "content": parts})
     return out_msgs, imgs
@@ -136,11 +142,17 @@ class HuggingFaceBackend:
     ) -> None:
         self.model_path = model_path
         self.model_name = model_name or model_path.rstrip("/").split("/")[-1]
-        self._dtype = {
+        _dtype_map = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
             "float32": torch.float32,
-        }.get(torch_dtype, torch.bfloat16)
+        }
+        if torch_dtype not in _dtype_map:
+            warning_once(
+                "unknown torch_dtype %r (expected one of %s); using bfloat16",
+                torch_dtype, sorted(_dtype_map),
+            )
+        self._dtype = _dtype_map.get(torch_dtype, torch.bfloat16)
 
         self._processor = None
         self._tokenizer = None
@@ -150,7 +162,11 @@ class HuggingFaceBackend:
                     model_path, trust_remote_code=trust_remote_code
                 )
                 self._tokenizer = self._processor.tokenizer
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "AutoProcessor failed for %s (%s); falling back to "
+                    "AutoTokenizer — vision will be disabled", model_path, e,
+                )
                 self._processor = None
         if self._tokenizer is None:
             self._tokenizer = AutoTokenizer.from_pretrained(
@@ -167,6 +183,26 @@ class HuggingFaceBackend:
         # `.generate()` is not thread-safe — serialise calls.
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _validate_gen_params(
+        max_new_tokens: int, temperature: float, top_p: float
+    ) -> tuple[int, float, float]:
+        """Clamp out-of-range sampling params to safe values, warning once each.
+
+        The server keeps serving on bad input rather than returning 400 — a
+        single rogue client field shouldn't take a model offline.
+        """
+        if not isinstance(max_new_tokens, int) or max_new_tokens <= 0:
+            warning_once("max_new_tokens=%r invalid; using 512", max_new_tokens)
+            max_new_tokens = 512
+        if temperature is None or temperature < 0:
+            warning_once("temperature=%r invalid; using 0.0 (greedy)", temperature)
+            temperature = 0.0
+        if top_p is None or not (0.0 < top_p <= 1.0):
+            warning_once("top_p=%r out of (0, 1]; using 1.0", top_p)
+            top_p = 1.0
+        return max_new_tokens, temperature, top_p
+
     def generate(
         self,
         messages: list[dict],
@@ -177,6 +213,9 @@ class HuggingFaceBackend:
         tools: list[dict] | None = None,
         chat_template_kwargs: dict | None = None,
     ) -> GenerationResult:
+        max_new_tokens, temperature, top_p = self._validate_gen_params(
+            max_new_tokens, temperature, top_p
+        )
         template_msgs, images = _coerce_for_template(messages)
         chat_template_kwargs = chat_template_kwargs or {}
         if tools:
@@ -193,7 +232,12 @@ class HuggingFaceBackend:
                 add_generation_prompt=True,
                 **chat_template_kwargs,
             )
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                "apply_chat_template failed (%s); falling back to a plain "
+                "role:content join — the model may not see the proper "
+                "chat/tool format", e,
+            )
             prompt_text = "\n".join(
                 f"{m['role']}: {m.get('content', '')}" for m in template_msgs
             ) + "\nassistant: "

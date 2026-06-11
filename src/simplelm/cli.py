@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from simplelm._logging import logger, setup_logging
 from simplelm.backends.hf import HuggingFaceBackend
 from simplelm.server import serve
 
@@ -37,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv if argv is not None else sys.argv[1:])
     if args.cmd != "serve":
         return 2
+    # Configure logging BEFORE building the backend, so the model-load
+    # logs (arch detection, dtype/processor fallbacks) are visible.
+    setup_logging(args.log_level)
+    logger.info("loading %s (dtype=%s, device_map=%s, tool_parser=%s)",
+                args.model_path, args.torch_dtype, args.device_map, args.tool_parser)
     backend = HuggingFaceBackend(
         args.model_path,
         model_name=args.model_name,
