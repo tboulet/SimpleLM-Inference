@@ -5,6 +5,7 @@ Functional baseline that runs anywhere torch can see a GPU.
 """
 from __future__ import annotations
 
+import copy
 import threading
 
 import torch
@@ -183,39 +184,70 @@ class HuggingFaceBackend:
         # `.generate()` is not thread-safe — serialise calls.
         self._lock = threading.Lock()
 
-    @staticmethod
-    def _validate_gen_params(
-        max_new_tokens: int, temperature: float, top_p: float
-    ) -> tuple[int, float, float]:
-        """Clamp out-of-range sampling params to safe values, warning once each.
+        self.max_model_len = self._derive_max_model_len(self._model.config)
+        if self.max_model_len:
+            logger.info("max_model_len=%d", self.max_model_len)
+        else:
+            warning_once(
+                "could not derive max_model_len from config for %s; /v1/models "
+                "will omit it and context-aware clients may assume a default",
+                self.model_path,
+            )
 
-        The server keeps serving on bad input rather than returning 400 — a
-        single rogue client field shouldn't take a model offline.
+    @staticmethod
+    def _derive_max_model_len(config) -> int | None:
+        """Best-effort context window from a HF config.
+
+        Multimodal models nest the LM config under `text_config`, so we look
+        there first. Different families name the field differently.
         """
-        if not isinstance(max_new_tokens, int) or max_new_tokens <= 0:
-            warning_once("max_new_tokens=%r invalid; using 512", max_new_tokens)
-            max_new_tokens = 512
-        if temperature is None or temperature < 0:
-            warning_once("temperature=%r invalid; using 0.0 (greedy)", temperature)
-            temperature = 0.0
-        if top_p is None or not (0.0 < top_p <= 1.0):
-            warning_once("top_p=%r out of (0, 1]; using 1.0", top_p)
-            top_p = 1.0
-        return max_new_tokens, temperature, top_p
+        keys = ("max_position_embeddings", "n_positions",
+                "seq_length", "max_sequence_length")
+        for cfg in (getattr(config, "text_config", None), config):
+            if cfg is None:
+                continue
+            for key in keys:
+                v = getattr(cfg, key, None)
+                if v:
+                    return int(v)
+        return None
+
+    # Per-field coercion. These clamp only *provided* values; a `None` is
+    # handled by the caller as "inherit the model's generation_config".
+    @staticmethod
+    def _coerce_max_new_tokens(v: int | None) -> int:
+        if v is None:
+            return 512
+        if not isinstance(v, int) or v <= 0:
+            warning_once("max_tokens=%r invalid; using 512", v)
+            return 512
+        return v
+
+    @staticmethod
+    def _coerce_temperature(v: float) -> float:
+        if v < 0:
+            warning_once("temperature=%r invalid; using 0.0 (greedy)", v)
+            return 0.0
+        return float(v)
+
+    @staticmethod
+    def _coerce_top_p(v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            warning_once("top_p=%r out of (0, 1]; using 1.0", v)
+            return 1.0
+        return float(v)
 
     def generate(
         self,
         messages: list[dict],
         *,
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 1.0,
+        max_new_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: list[str] | None = None,
         tools: list[dict] | None = None,
         chat_template_kwargs: dict | None = None,
     ) -> GenerationResult:
-        max_new_tokens, temperature, top_p = self._validate_gen_params(
-            max_new_tokens, temperature, top_p
-        )
         template_msgs, images = _coerce_for_template(messages)
         chat_template_kwargs = chat_template_kwargs or {}
         if tools:
@@ -252,22 +284,48 @@ class HuggingFaceBackend:
             ).to(self._model.device)
 
         prompt_len = inputs["input_ids"].shape[1]
-        do_sample = (temperature or 0.0) > 0.0
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            pad_token_id=self._tokenizer.eos_token_id,
-        )
-        if do_sample:
-            gen_kwargs["temperature"] = float(temperature)
-            gen_kwargs["top_p"] = float(top_p)
+
+        # Start from the model's own GenerationConfig (eos_token_id — the chat
+        # turn-end such as Qwen's <|im_end|> — plus repetition_penalty, top_k,
+        # top_p, …) and override only the fields the client explicitly set, so
+        # the model's tuned sampling stands when the client omits a field.
+        gen_cfg = copy.deepcopy(self._model.generation_config)
+        gen_cfg.max_new_tokens = self._coerce_max_new_tokens(max_new_tokens)
+        if temperature is not None:
+            t = self._coerce_temperature(temperature)
+            gen_cfg.do_sample = t > 0.0
+            if t > 0.0:
+                gen_cfg.temperature = t
+        if top_p is not None:
+            gen_cfg.top_p = self._coerce_top_p(top_p)
+        # EOS / pad fallback for the rare model that ships no generation_config
+        # eos — without this, generation would run to max_new_tokens.
+        if gen_cfg.eos_token_id is None:
+            gen_cfg.eos_token_id = self._tokenizer.eos_token_id
+        if gen_cfg.pad_token_id is None:
+            gen_cfg.pad_token_id = self._tokenizer.eos_token_id
+
+        gen_kwargs: dict = {}
+        if stop:
+            # transformers halts when any of these strings is produced; it
+            # needs the tokenizer to detokenise the running output.
+            gen_kwargs["stop_strings"] = stop
+            gen_kwargs["tokenizer"] = self._tokenizer
 
         with self._lock, torch.no_grad():
-            out_ids = self._model.generate(**inputs, **gen_kwargs)
+            out_ids = self._model.generate(
+                **inputs, generation_config=gen_cfg, **gen_kwargs
+            )
         completion_ids = out_ids[0][prompt_len:]
         text = self._tokenizer.decode(completion_ids, skip_special_tokens=True)
         completion_len = int(completion_ids.shape[0])
-        finish = "length" if completion_len >= max_new_tokens else "stop"
+        # transformers appends the matched stop string to the output — trim it.
+        if stop:
+            for s in stop:
+                if s and text.endswith(s):
+                    text = text[: -len(s)]
+                    break
+        finish = "length" if completion_len >= gen_cfg.max_new_tokens else "stop"
         return GenerationResult(
             text=text,
             prompt_tokens=int(prompt_len),

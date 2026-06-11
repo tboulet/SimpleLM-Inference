@@ -56,7 +56,11 @@ app = FastAPI(title="simplelm", lifespan=_lifespan)
 @app.get("/v1/models", response_model=ModelList)
 async def list_models() -> ModelList:
     b = _get_backend()
-    return ModelList(data=[ModelInfo(id=b.model_name, created=int(time.time()))])
+    return ModelList(data=[ModelInfo(
+        id=b.model_name,
+        created=int(time.time()),
+        max_model_len=getattr(b, "max_model_len", None),
+    )])
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
@@ -69,11 +73,17 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
         [t.model_dump(exclude_none=True) for t in req.tools] if req.tools else None
     )
 
+    # Pass params straight through. None ⇒ the backend uses the model's
+    # generation_config default for that field. `stop` is normalised to a list.
+    stop = req.stop
+    if isinstance(stop, str):
+        stop = [stop]
     result = backend.generate(
         plain_msgs,
-        max_new_tokens=int(req.max_tokens or 512),
-        temperature=float(req.temperature or 0.7),
-        top_p=float(req.top_p or 1.0),
+        max_new_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        stop=stop,
         tools=tools_arg,
         chat_template_kwargs=req.chat_template_kwargs,
     )

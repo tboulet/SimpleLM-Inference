@@ -55,9 +55,11 @@ class ToolDef(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
-    max_tokens: int | None = 512
-    temperature: float | None = 0.7
-    top_p: float | None = 1.0
+    # None ⇒ use the model's own generation_config default for this field.
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    stop: str | list[str] | None = None
     stream: bool | None = False
     tools: list[ToolDef] | None = None
     tool_choice: str | dict | None = None
@@ -94,6 +96,10 @@ class ModelInfo(BaseModel):
     object: Literal["model"] = "model"
     owned_by: str = "simplelm"
     created: int
+    # Context window. AlanCode (and vLLM/SGLang clients) read this from
+    # /v1/models to size conversation compaction. Omitted (None) if the
+    # model config doesn't expose it.
+    max_model_len: int | None = None
 
 
 class ModelList(BaseModel):

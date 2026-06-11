@@ -23,15 +23,24 @@ class Backend(Protocol):
     """
 
     model_name: str
+    max_model_len: int | None  # context window, or None if unknown
 
     def generate(
         self,
         messages: list[dict],
         *,
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 1.0,
+        max_new_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: list[str] | None = None,
         tools: list[dict] | None = None,
         chat_template_kwargs: dict | None = None,
     ) -> GenerationResult:
+        """Generate one completion.
+
+        Sampling params that are ``None`` mean "use the backend/model's own
+        default" — the HF backend uses the model's ``generation_config`` value
+        for that field (its tuned ``top_p`` / ``repetition_penalty`` /
+        ``top_k``). ``stop`` is the OpenAI stop-sequence list.
+        """
         ...
