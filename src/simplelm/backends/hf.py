@@ -36,6 +36,18 @@ def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_c
     )
     logger.info("detected architecture %r (is_vlm=%s)", arch, is_vlm)
 
+    # PyTorch's memory-efficient SDP backend miscomputes *sliding-window*
+    # attention on the ROCm/gfx90a stack (gemma-4 → <pad> past the window). For
+    # such models disable it so SDPA uses the correct flash/MATH backend. Models
+    # without a sliding window keep mem-efficient (the memory-frugal path — MATH
+    # is O(seq²) and OOMs on long agent contexts).
+    sliding = getattr(cfg, "sliding_window", None) or getattr(
+        getattr(cfg, "text_config", None), "sliding_window", None
+    )
+    if sliding and torch.version.hip is not None:
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        logger.info("sliding_window=%s on ROCm — disabled mem-efficient SDP", sliding)
+
     # Try the VLM head first if config looks multimodal, else CausalLM
     # first. Each branch falls through to others on failure.
     candidates = []
