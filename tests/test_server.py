@@ -25,6 +25,7 @@ class MockBackend:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 1.0,
+        stop=None,
         tools=None,
         chat_template_kwargs=None,
     ) -> GenerationResult:
@@ -109,6 +110,89 @@ def test_tool_call_parsed_via_gemma4():
     srv._TOOL_PARSER_NAME = "noop"
 
 
+def _universal_client(canned_text: str) -> TestClient:
+    from simplelm import server as srv
+    srv._TOOL_PARSER_NAME = "universal"
+    set_backend(MockBackend(canned_text=canned_text))
+    return TestClient(app)
+
+
+def _restore_parser() -> None:
+    from simplelm import server as srv
+    srv._TOOL_PARSER_NAME = "noop"
+
+
+def test_json_data_not_parsed_as_tool_call():
+    """No tools declared + a JSON data answer -> content preserved, no phantom call."""
+    client = _universal_client('{"name": "Alice", "age": 30}')
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "Return JSON with name and age."}],
+        })
+        assert r.status_code == 200
+        msg = r.json()["choices"][0]["message"]
+        assert msg.get("tool_calls") in (None, [])
+        assert '"Alice"' in msg["content"]
+    finally:
+        _restore_parser()
+
+
+def test_real_tool_call_with_arguments_extracted():
+    client = _universal_client('{"name": "get_weather", "arguments": {"city": "Paris"}}')
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "weather?"}],
+        })
+        assert r.status_code == 200
+        msg = r.json()["choices"][0]["message"]
+        assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert r.json()["choices"][0]["finish_reason"] == "tool_calls"
+    finally:
+        _restore_parser()
+
+
+def test_inline_tool_call_resolved_via_declared_tools():
+    """Inline-args call is recognised because the request declared the tool name."""
+    client = _universal_client('{"name": "get_weather", "city": "Paris"}')
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                },
+            }],
+        })
+        assert r.status_code == 200
+        msg = r.json()["choices"][0]["message"]
+        assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
+        import json as _json
+        assert _json.loads(msg["tool_calls"][0]["function"]["arguments"]) == {"city": "Paris"}
+    finally:
+        _restore_parser()
+
+
+def test_tool_choice_none_disables_extraction():
+    client = _universal_client('{"name": "get_weather", "arguments": {"city": "Paris"}}')
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tool_choice": "none",
+        })
+        assert r.status_code == 200
+        msg = r.json()["choices"][0]["message"]
+        assert msg.get("tool_calls") in (None, [])
+        assert "get_weather" in msg["content"]
+    finally:
+        _restore_parser()
+
+
 def test_multimodal_content_array_accepted(client):
     """Server should accept (and forward to backend) an OpenAI multimodal content array."""
     r = client.post("/v1/chat/completions", json={
@@ -126,3 +210,52 @@ def test_multimodal_content_array_accepted(client):
     assert r.status_code == 200
     # MockBackend ignores image content — we just verify the server didn't choke on the schema.
     assert "Paris" in r.json()["choices"][0]["message"]["content"]
+
+
+def test_context_overflow_returns_openai_context_error():
+    """An over-budget request surfaces as an OpenAI-shaped context error (400,
+    code context_length_exceeded) so litellm/Alan-Code compact instead of crash."""
+    from simplelm.backends.base import ContextOverflowError
+
+    @dataclass
+    class OverflowBackend:
+        model_name: str = "mock-model"
+
+        def generate(self, messages, **kwargs):
+            raise ContextOverflowError(prompt_tokens=9000, max_new_tokens=512, safe_context=8192)
+
+    set_backend(OverflowBackend())
+    client = TestClient(app)
+    r = client.post("/v1/chat/completions", json={
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "x"}],
+    })
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["code"] == "context_length_exceeded"
+    # The message must contain phrases Alan-Code matches as prompt-too-long
+    # (alancode/api/errors.py) so the agent compacts instead of crashing.
+    msg = err["message"].lower()
+    assert "maximum context length" in msg
+    assert "context_length_exceeded" in msg
+
+
+def test_metrics_logged_to_jsonl(tmp_path, monkeypatch):
+    """Each completion appends one JSONL metrics line with the expected keys."""
+    import json
+    from simplelm import server as srv
+
+    metrics_file = tmp_path / "metrics.jsonl"
+    monkeypatch.setattr(srv, "_METRICS_FILE", str(metrics_file))
+    set_backend(MockBackend())
+    client = TestClient(app)
+    r = client.post("/v1/chat/completions", json={
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200
+    lines = metrics_file.read_text().strip().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["model"] == "mock-model"
+    assert set(("ts", "prompt_tokens", "completion_tokens", "prefill_ms", "decode_ms")) <= rec.keys()

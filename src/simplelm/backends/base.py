@@ -11,6 +11,33 @@ class GenerationResult:
     prompt_tokens: int
     completion_tokens: int
     finish_reason: str  # "stop" | "length" | "tool_calls" | "error"
+    prefill_ms: float | None = None  # wall time to the first generated token
+    decode_ms: float | None = None   # wall time for the remaining tokens
+
+
+class ContextOverflowError(Exception):
+    """prompt + max_new_tokens would exceed the VRAM-safe context.
+
+    Raised before generate() so the server returns a clean 4xx instead of the
+    backend crashing on an OOM / position-index error mid-generation.
+    """
+
+    def __init__(self, prompt_tokens: int, max_new_tokens: int, safe_context: int):
+        self.prompt_tokens = prompt_tokens
+        self.max_new_tokens = max_new_tokens
+        self.safe_context = safe_context
+        # Phrased like OpenAI's context error ("maximum context length" +
+        # "context_length_exceeded") so OpenAI-compatible clients (litellm,
+        # Alan-Code) classify it as a context overflow and compact/retry, rather
+        # than treat it as an unknown hard failure. Alan-Code matches on this
+        # text (alancode/api/errors.py _PROMPT_TOO_LONG_PATTERNS).
+        super().__init__(
+            f"This model's maximum context length is {safe_context} tokens "
+            f"(VRAM-safe limit). However, your request has "
+            f"{prompt_tokens + max_new_tokens} tokens ({prompt_tokens} in the "
+            f"messages, {max_new_tokens} for the completion). Reduce the input "
+            f"length. (code: context_length_exceeded)"
+        )
 
 
 class Backend(Protocol):

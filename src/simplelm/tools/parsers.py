@@ -375,13 +375,42 @@ def parse_name_then_json(raw: str) -> tuple[str, list[dict]]:
     return "".join(leftover_parts).strip(), calls
 
 
-def parse_json_object(raw: str) -> tuple[str, list[dict]]:
+def _json_object_to_call(obj, known_tool_names: set[str]) -> dict | None:
+    """Decide whether a bare JSON object is a tool call, else return None.
+
+    A bare object counts as a call only when it names a function AND
+    carries a callable payload:
+      - an explicit ``arguments``/``parameters`` mapping, or
+      - a ``name`` matching a declared tool, whose remaining keys are then
+        the inline arguments.
+    A plain data object that merely has a ``name`` field (e.g.
+    ``{"name": "Alice", "age": 30}``) is left as content.
+    """
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    if "arguments" in obj or "parameters" in obj:
+        args = obj.get("arguments") or obj.get("parameters") or {}
+        return _mk_call(name, args)
+    if name in known_tool_names:
+        args = {k: v for k, v in obj.items() if k != "name"}
+        return _mk_call(name, args)
+    return None
+
+
+def parse_json_object(raw: str, tool_names=None) -> tuple[str, list[dict]]:
     """A bare JSON object ``{"name": "x", "arguments": {...}}`` (or a list).
 
-    Useful for models that emit OpenAI-shaped tool calls directly in
-    their response text. Uses brace-counting to handle nested objects
-    that regex alone can't.
+    Recognises OpenAI-shaped tool calls emitted directly in the response
+    text. `tool_names` is the set of function names the request declared;
+    it lets a call whose arguments are inlined (no ``arguments`` wrapper,
+    e.g. ``{"name": "get_weather", "city": "Paris"}``) be recognised. See
+    `_json_object_to_call` for what qualifies. Uses brace-counting to
+    handle nested objects that regex alone can't.
     """
+    known = set(tool_names or ())
     calls: list[dict] = []
     leftover_parts: list[str] = []
     last = 0
@@ -417,11 +446,11 @@ def parse_json_object(raw: str) -> tuple[str, list[dict]]:
                 except json.JSONDecodeError:
                     i = j + 1
                     continue
-                if isinstance(obj, dict) and obj.get("name"):
-                    args = obj.get("arguments") or obj.get("parameters") or {}
+                call = _json_object_to_call(obj, known)
+                if call is not None:
                     leftover_parts.append(raw[last:i])
                     last = j + 1
-                    calls.append(_mk_call(obj["name"], args))
+                    calls.append(call)
                 i = j + 1
                 continue
         i += 1
@@ -431,11 +460,14 @@ def parse_json_object(raw: str) -> tuple[str, list[dict]]:
     return "".join(leftover_parts).strip(), calls
 
 
-def parse_universal(raw: str) -> tuple[str, list[dict]]:
+def parse_universal(raw: str, tool_names=None) -> tuple[str, list[dict]]:
     """Try every known parser in order; return the first that finds calls.
 
     Useful as a default when you don't know which format the model
-    prefers (or when it varies between turns).
+    prefers (or when it varies between turns). Marker-based family parsers
+    are unambiguous and run regardless of declared tools; the bare-JSON
+    fallback is threaded `tool_names` so it can recognise a call whose
+    arguments are inlined without an ``arguments`` wrapper.
     """
     for fn in (
         parse_gemma4,
@@ -447,12 +479,11 @@ def parse_universal(raw: str) -> tuple[str, list[dict]]:
         parse_simple_call,
         parse_name_then_json,
         parse_python_call,
-        parse_json_object,
     ):
         content, calls = fn(raw)
         if calls:
             return content, calls
-    return raw, []
+    return parse_json_object(raw, tool_names)
 
 
 def parse_deepseek_v4(raw: str) -> tuple[str, list[dict]]:

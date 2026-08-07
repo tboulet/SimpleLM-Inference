@@ -199,6 +199,94 @@ def test_json_object_basic():
     assert calls[0]["function"]["name"] == "lookup"
 
 
+def test_json_object_plain_data_preserved():
+    """A data object that merely has a `name` field must stay in content."""
+    parse = get_parser("json_object")
+    raw = '{"name": "Alice", "age": 30}'
+    content, calls = parse(raw)
+    assert calls == []
+    assert content == raw
+
+
+def test_json_object_real_call_with_arguments():
+    parse = get_parser("json_object")
+    raw = '{"name": "get_weather", "arguments": {"city": "Paris"}}'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+
+
+def test_json_object_arguments_as_json_string():
+    """`arguments` given as a JSON string (not an object) is preserved verbatim."""
+    parse = get_parser("json_object")
+    raw = '{"name": "get_weather", "arguments": "{\\"city\\": \\"Paris\\"}"}'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+
+
+def test_json_object_inline_args_with_declared_tool():
+    """Inline args (no `arguments` wrapper) resolve only against a declared tool."""
+    parse = get_parser("json_object")
+    raw = '{"name": "get_weather", "city": "Paris"}'
+    content, calls = parse(raw, tool_names={"get_weather"})
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+
+
+def test_json_object_inline_args_without_declared_tool_preserved():
+    """The same object is indistinguishable from data when no tool is declared."""
+    parse = get_parser("json_object")
+    raw = '{"name": "get_weather", "city": "Paris"}'
+    content, calls = parse(raw)
+    assert calls == []
+    assert content == raw
+
+
+def test_json_object_fenced_call_detected():
+    parse = get_parser("json_object")
+    raw = '```json\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n```'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+
+
+def test_json_object_multiple_calls():
+    parse = get_parser("json_object")
+    raw = '{"name": "a", "arguments": {"x": 1}} and {"name": "b", "arguments": {"y": 2}}'
+    content, calls = parse(raw)
+    assert [c["function"]["name"] for c in calls] == ["a", "b"]
+
+
+def test_json_object_data_object_amid_a_real_call():
+    """A plain data object stays in content while a sibling real call extracts."""
+    parse = get_parser("json_object")
+    raw = '{"name": "Alice", "age": 30} then {"name": "get_weather", "arguments": {"city": "Paris"}}'
+    content, calls = parse(raw)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert '"Alice"' in content
+
+
+def test_universal_preserves_plain_json_data():
+    """Regression guard for the canonical probe case: no tools, JSON data output."""
+    parse = get_parser("universal")
+    raw = '{"name": "Alice", "age": 30}'
+    content, calls = parse(raw)
+    assert calls == []
+    assert content == raw
+
+
+def test_universal_inline_call_with_declared_tool():
+    parse = get_parser("universal")
+    raw = '{"name": "get_weather", "city": "Paris"}'
+    content, calls = parse(raw, tool_names={"get_weather"})
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+
+
 def test_universal_falls_through():
     """universal tries each format until one matches."""
     parse = get_parser("universal")

@@ -6,14 +6,155 @@ Functional baseline that runs anywhere torch can see a GPU.
 from __future__ import annotations
 
 import copy
+import os
 import threading
+import time
 
 import torch
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoProcessor,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
-from simplelm.backends.base import Backend, GenerationResult
+from simplelm.backends.base import Backend, ContextOverflowError, GenerationResult
 from simplelm.vision import load_image
 from simplelm._logging import logger, warning_once
+
+
+def _shim_torch_accelerator() -> None:
+    """gptqmodel >= 7 calls `torch.accelerator.*` (added in torch 2.6), but the
+    pinned ROCm build here is torch 2.5. Provide the minimal surface so GPTQ
+    checkpoints load, mapping the accelerator to the (ROCm-masquerading) cuda
+    device. No-op once torch ships the real module."""
+    if hasattr(torch, "accelerator"):
+        return
+    import sys
+    import types
+
+    acc = types.ModuleType("torch.accelerator")
+    acc.is_available = lambda: torch.cuda.is_available()
+    acc.device_count = lambda: torch.cuda.device_count() if torch.cuda.is_available() else 0
+    acc.current_accelerator = lambda *a, **k: (
+        torch.device("cuda") if torch.cuda.is_available() else None)
+    torch.accelerator = acc
+    sys.modules["torch.accelerator"] = acc
+
+
+_shim_torch_accelerator()
+
+# Context guard: what to do when prompt + max_new_tokens exceeds the VRAM-safe
+# context. "reject" -> 4xx (safe default); "truncate" -> drop oldest prompt
+# tokens; "off" -> no guard (legacy). Fraction of free VRAM to budget for KV.
+_CTX_POLICY = os.environ.get("SIMPLELM_CONTEXT_POLICY", "reject")
+_KV_SAFETY_FRACTION = float(os.environ.get("SIMPLELM_KV_SAFETY_FRACTION", "0.9"))
+# On-the-fly weight quantization (bitsandbytes): "4bit" (nf4) / "8bit" halve or
+# quarter the weight VRAM so a bigger model fits fewer GCDs. Needs bitsandbytes
+# (ROCm build). "" = full precision.
+_QUANT = os.environ.get("SIMPLELM_QUANTIZATION", "").lower()
+# Fraction of each GPU a quantized model's weights may use when we build its
+# device_map (see _quantized_device_map). The weights are spread across the GPUs
+# with this as the per-device ceiling, so the rest stays free for the KV cache.
+_QUANT_GPU_FRACTION = float(os.environ.get("SIMPLELM_QUANT_GPU_FRACTION", "0.9"))
+
+
+class _FirstTokenTimer(StoppingCriteria):
+    """Records the wall-clock of the first generated token (never stops
+    generation), so prefill and decode time can be split for metrics."""
+
+    def __init__(self):
+        self.t_first = None
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if self.t_first is None:
+            self.t_first = time.perf_counter()
+        return False
+
+
+def _build_quant_config():
+    """BitsAndBytesConfig for SIMPLELM_QUANTIZATION, or None for full precision.
+
+    4bit (nf4, double-quant, bf16 compute) quarters the weight VRAM; 8bit halves
+    it, so a bf16 model that needs N GCDs fits fewer. Requires a ROCm
+    bitsandbytes build.
+    """
+    if _QUANT not in ("4bit", "8bit"):
+        return None
+    from transformers import BitsAndBytesConfig
+    if _QUANT == "4bit":
+        cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        cfg = BitsAndBytesConfig(load_in_8bit=True)
+    logger.info("SIMPLELM_QUANTIZATION=%s -> bitsandbytes", _QUANT)
+    return cfg
+
+
+def _quantized_device_map(cfg, quant: str, fraction: float):
+    """Explicit device_map for a bnb-quantized load, sized on the QUANTIZED
+    element size (INT4/INT8) and spread across the visible GPUs.
+
+    transformers' auto planner sizes device placement on the *unquantized* (bf16)
+    dtype for our bnb build - Bnb4BitHfQuantizer exposes no target-dtype hook - so
+    it plans a 462 GiB footprint and offloads layers to CPU/disk (which bnb 4-bit
+    rejects) even though the 4-bit weights are ~4x smaller and fit easily. Building
+    the map ourselves at the quantized size places it GPU-resident, spread evenly
+    so each device keeps room for the KV cache. Returns "auto" (transformers'
+    default) if a map cannot be built or would still spill off-GPU."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return "auto"
+    try:
+        from accelerate import init_empty_weights, infer_auto_device_map
+        from accelerate.utils import CustomDtype
+        from transformers import AutoModelForCausalLM
+
+        qdtype = CustomDtype.INT4 if quant == "4bit" else CustomDtype.INT8
+        bytes_per = 0.5 if quant == "4bit" else 1.0
+        with init_empty_weights():
+            meta = AutoModelForCausalLM.from_config(cfg)
+        nsm = list(getattr(meta, "_no_split_modules", []) or [])
+        n = torch.cuda.device_count()
+        q_bytes = sum(p.numel() for p in meta.parameters()) * bytes_per
+        # Per-GPU ceiling: enough to spread the weights evenly (+30% slack for the
+        # no-split granularity), but never above `fraction` of the device.
+        even = int(q_bytes / n * 1.3)
+        cap = {i: min(even, int(torch.cuda.get_device_properties(i).total_memory * fraction))
+               for i in range(n)}
+        dmap = infer_auto_device_map(meta, max_memory=cap, dtype=qdtype,
+                                     no_split_module_classes=nsm)
+        if any(str(d) in ("cpu", "disk") for d in dmap.values()):
+            logger.warning("quantized device_map still spills off-GPU; using auto")
+            return "auto"
+        return dmap
+    except Exception as e:  # noqa: BLE001 - any failure -> transformers' default
+        logger.warning("could not build quantized device_map (%s); using auto", e)
+        return "auto"
+
+
+def _prequant_bits(cfg):
+    """'4bit'/'8bit' if the checkpoint is a pre-serialized **bitsandbytes** model,
+    else None. bnb keeps the weights int4 in VRAM, but its quantizer makes the HF
+    auto planner size on bf16 and offload, so it needs our explicit int4
+    device_map. GPTQ/AWQ size fine on their own; compressed-tensors decompresses to
+    bf16 on ROCm (no int4 kernel), so an int4 device_map would under-plan it - both
+    return None."""
+    qc = getattr(cfg, "quantization_config", None)
+    if not isinstance(qc, dict):
+        return None
+    method = (qc.get("quant_method") or "").lower()
+    if method and method != "bitsandbytes":
+        return None
+    if qc.get("load_in_4bit"):
+        return "4bit"
+    if qc.get("load_in_8bit"):
+        return "8bit"
+    return None
 
 
 def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_code):
@@ -44,9 +185,23 @@ def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_c
     sliding = getattr(cfg, "sliding_window", None) or getattr(
         getattr(cfg, "text_config", None), "sliding_window", None
     )
-    if sliding and torch.version.hip is not None:
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        logger.info("sliding_window=%s on ROCm — disabled mem-efficient SDP", sliding)
+    # Attention backend: prefer FlashAttention-2 when the flash_attn library is
+    # importable. It computes sliding-window attention correctly AND memory-
+    # efficiently - the only fast+correct path on ROCm/gfx90a, where SDPA's flash
+    # backend rejects the sliding mask, mem-efficient miscomputes it, and MATH is
+    # O(seq^2) (OOMs on long contexts). Without flash_attn, fall back to SDPA with
+    # the broken mem-efficient backend disabled for sliding-window models.
+    attn_impl = None
+    try:
+        import flash_attn as _flash_attn
+        attn_impl = "flash_attention_2"
+        logger.info("flash_attn %s present - attn_implementation=flash_attention_2",
+                    _flash_attn.__version__)
+    except ImportError:
+        if sliding and torch.version.hip is not None:
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            logger.info("sliding_window=%s on ROCm, no flash_attn - disabled mem-efficient SDP",
+                        sliding)
 
     # Try the VLM head first if config looks multimodal, else CausalLM
     # first. Each branch falls through to others on failure.
@@ -65,26 +220,50 @@ def _load_model_auto(model_path: str, *, torch_dtype, device_map, trust_remote_c
             pass
     candidates.append(AutoModelForCausalLM)
 
-    errors : list[Exception] = []
-    for cls in candidates:
+    quant_cfg = _build_quant_config()
+    # Size the device_map on the quantized element size (see _quantized_device_map
+    # and _prequant_bits) - for bnb the HF auto planner sizes on bf16 and offloads
+    # a model that fits in 4-bit.
+    bits = _QUANT if quant_cfg is not None else _prequant_bits(cfg)
+    if device_map == "auto" and bits in ("4bit", "8bit"):
+        device_map = _quantized_device_map(cfg, bits, _QUANT_GPU_FRACTION)
+
+    def _load(attn):
+        kw = dict(torch_dtype=torch_dtype, device_map=device_map,
+                  trust_remote_code=trust_remote_code)
+        if attn:
+            kw["attn_implementation"] = attn
+        if quant_cfg is not None:
+            kw["quantization_config"] = quant_cfg
+        errs: list[Exception] = []
+        for cls in candidates:
+            try:
+                return cls.from_pretrained(model_path, **kw), errs
+            except ValueError as e:
+                # ValueError = this head rejects the config (or the attn impl).
+                logger.info("AutoModel head %s rejected arch=%r: %s - trying next candidate",
+                            cls.__name__, arch, e)
+                errs.append(e)
+        return None, errs
+
+    # Try the preferred attn impl, then the default. flash_attention_2 can fail
+    # with ValueError (arch unsupported) or ImportError (a missing flash_attn dep):
+    # both must degrade to the default rather than kill serving.
+    errors: list[Exception] = []
+    for attn in ([attn_impl, None] if attn_impl else [None]):
         try:
-            return cls.from_pretrained(
-                model_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-                trust_remote_code=trust_remote_code,
-            )
-        except ValueError as e:
-            # ValueError is what AutoModel raises when the config doesn't
-            # match. Keep trying other heads.
-            logger.info(
-                "AutoModel head %s rejected arch=%r: %s — trying next candidate",
-                cls.__name__, arch, e,
-            )
-            errors.append(e)
+            model, errors = _load(attn)
+        except ImportError as e:
+            logger.warning("attn_implementation=%r unavailable (%s) - falling back to default", attn, e)
             continue
+        if model is not None:
+            if attn:
+                logger.info("loaded with attn_implementation=%s", attn)
+            return model
+    sep = "\n\n----------\n\n"
     raise RuntimeError(
-        f"None of the AutoModel heads accept config arch={arch!r}. Errors: {'\n\n----------\n\n'.join(str(e) for e in errors)}"
+        f"None of the AutoModel heads accept config arch={arch!r}. "
+        f"Errors: {sep.join(str(e) for e in errors)}"
     )
 
 
@@ -206,6 +385,34 @@ class HuggingFaceBackend:
                 self.model_path,
             )
 
+        self.max_safe_context = self._compute_max_safe_context(self._model.config)
+        if self.max_safe_context:
+            logger.info("max_safe_context=%d (KV budget from free VRAM)", self.max_safe_context)
+
+    def _compute_max_safe_context(self, config) -> int | None:
+        """Largest context (prompt + generation) that fits the free VRAM after
+        weights, from the per-token KV-cache size. Approximate: it ignores
+        activation / attention workspace, hence the safety fraction. Returns
+        None (guard disabled) if it can't be computed, e.g. no CUDA."""
+        if not torch.cuda.is_available():
+            return None
+        tc = getattr(config, "text_config", None) or config
+        n_layers = getattr(tc, "num_hidden_layers", None)
+        n_kv = getattr(tc, "num_key_value_heads", None) or getattr(tc, "num_attention_heads", None)
+        head_dim = getattr(tc, "head_dim", None)
+        if head_dim is None:
+            hs, nh = getattr(tc, "hidden_size", None), getattr(tc, "num_attention_heads", None)
+            head_dim = (hs // nh) if hs and nh else None
+        if not (n_layers and n_kv and head_dim):
+            return None
+        dtype_bytes = torch.empty(0, dtype=self._dtype).element_size()
+        per_token_kv = 2 * n_layers * n_kv * head_dim * dtype_bytes  # K + V
+        free = sum(torch.cuda.mem_get_info(d)[0] for d in range(torch.cuda.device_count()))
+        ctx = int(_KV_SAFETY_FRACTION * free) // per_token_kv
+        if self.max_model_len:
+            ctx = min(ctx, self.max_model_len)
+        return int(ctx)
+
     @staticmethod
     def _derive_max_model_len(config) -> int | None:
         """Best-effort context window from a HF config.
@@ -317,6 +524,24 @@ class HuggingFaceBackend:
         if gen_cfg.pad_token_id is None:
             gen_cfg.pad_token_id = self._tokenizer.eos_token_id
 
+        # Context guard: check before generate() so an over-budget request
+        # returns a clean error (or is truncated) instead of crashing on an OOM
+        # / position-index error partway through generation.
+        if self.max_safe_context and _CTX_POLICY != "off":
+            need = prompt_len + gen_cfg.max_new_tokens
+            if need > self.max_safe_context:
+                if _CTX_POLICY == "truncate":
+                    keep = max(1, self.max_safe_context - gen_cfg.max_new_tokens)
+                    for k in ("input_ids", "attention_mask"):
+                        if k in inputs:
+                            inputs[k] = inputs[k][:, -keep:]
+                    prompt_len = inputs["input_ids"].shape[1]
+                    warning_once("context %d > safe %d; truncated prompt to %d tokens",
+                                 need, self.max_safe_context, prompt_len)
+                else:
+                    raise ContextOverflowError(prompt_len, gen_cfg.max_new_tokens,
+                                               self.max_safe_context)
+
         gen_kwargs: dict = {}
         if stop:
             # transformers halts when any of these strings is produced; it
@@ -324,14 +549,23 @@ class HuggingFaceBackend:
             gen_kwargs["stop_strings"] = stop
             gen_kwargs["tokenizer"] = self._tokenizer
 
+        # Split prefill vs decode time with a no-op criterion that timestamps
+        # the first generated token.
+        timer = _FirstTokenTimer()
+        gen_kwargs["stopping_criteria"] = StoppingCriteriaList([timer])
+        t_start = time.perf_counter()
         with self._lock, torch.no_grad():
             out_ids = self._model.generate(
                 **inputs, generation_config=gen_cfg, **gen_kwargs
             )
+        t_end = time.perf_counter()
+        prefill_ms = (timer.t_first - t_start) * 1000.0 if timer.t_first else None
+        decode_ms = (t_end - timer.t_first) * 1000.0 if timer.t_first else None
+
         completion_ids = out_ids[0][prompt_len:]
         text = self._tokenizer.decode(completion_ids, skip_special_tokens=True)
         completion_len = int(completion_ids.shape[0])
-        # transformers appends the matched stop string to the output — trim it.
+        # transformers appends the matched stop string to the output; trim it.
         if stop:
             for s in stop:
                 if s and text.endswith(s):
@@ -343,4 +577,6 @@ class HuggingFaceBackend:
             prompt_tokens=int(prompt_len),
             completion_tokens=completion_len,
             finish_reason=finish,
+            prefill_ms=prefill_ms,
+            decode_ms=decode_ms,
         )

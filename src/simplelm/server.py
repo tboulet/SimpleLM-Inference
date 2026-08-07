@@ -6,6 +6,7 @@ Wraps a single `Backend` instance and exposes `/v1/models` +
 """
 from __future__ import annotations
 
+import inspect
 import json as json_module
 import os
 import time
@@ -15,9 +16,9 @@ from typing import AsyncGenerator, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from simplelm.backends.base import Backend
+from simplelm.backends.base import Backend, ContextOverflowError
 from simplelm.schema import (
     ChatChoice,
     ChatCompletionRequest,
@@ -32,6 +33,61 @@ from simplelm.tools import get_parser
 # Process-global backend slot. Set by `serve()` before app start.
 _BACKEND: dict[str, Optional[Backend]] = {"backend": None}
 _TOOL_PARSER_NAME = os.environ.get("SIMPLELM_TOOL_PARSER", "noop")
+
+# Per-request metrics sink (one JSON line per completion). Set SIMPLELM_METRICS=0
+# to disable. Path override via SIMPLELM_METRICS_FILE.
+_METRICS_FILE = os.environ.get(
+    "SIMPLELM_METRICS_FILE", os.path.expanduser("~/.simplelm/metrics.jsonl")
+)
+
+
+def _log_metrics(model: str, result) -> None:
+    """Append one metrics line. Fail-safe: never breaks serving."""
+    if os.environ.get("SIMPLELM_METRICS", "1") == "0":
+        return
+    try:
+        decode_s = (result.decode_ms or 0) / 1000.0
+        rec = {
+            "ts": time.time(),
+            "model": model,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "prefill_ms": round(result.prefill_ms, 1) if result.prefill_ms else None,
+            "decode_ms": round(result.decode_ms, 1) if result.decode_ms else None,
+            "decode_tok_s": round(result.completion_tokens / decode_s, 2)
+            if decode_s and result.completion_tokens else None,
+            "finish_reason": result.finish_reason,
+        }
+        os.makedirs(os.path.dirname(_METRICS_FILE), exist_ok=True)
+        with open(_METRICS_FILE, "a") as fh:
+            fh.write(json_module.dumps(rec) + "\n")
+    except Exception:  # metrics must never break serving
+        pass
+
+
+def _declared_tool_names(tools_arg) -> set[str]:
+    names: set[str] = set()
+    for t in tools_arg or []:
+        fn = (t or {}).get("function") or {}
+        name = fn.get("name")
+        if name:
+            names.add(name)
+    return names
+
+
+def _extract_tool_calls(parser, text: str, tools_arg, tool_choice) -> tuple[str, list[dict]]:
+    """Run `parser` over `text`, returning (content, tool_calls).
+
+    `tool_choice == "none"` disables extraction (OpenAI semantics: the
+    caller forbids a tool call). Otherwise the declared tool names are
+    threaded to parsers that accept them so a call with inline arguments
+    (no ``arguments`` wrapper) can be disambiguated from plain JSON data.
+    """
+    if tool_choice == "none":
+        return text, []
+    if "tool_names" in inspect.signature(parser).parameters:
+        return parser(text, tool_names=_declared_tool_names(tools_arg))
+    return parser(text)
 
 
 def set_backend(backend: Backend) -> None:
@@ -78,19 +134,33 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
     stop = req.stop
     if isinstance(stop, str):
         stop = [stop]
-    result = backend.generate(
-        plain_msgs,
-        max_new_tokens=req.max_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        stop=stop,
-        tools=tools_arg,
-        chat_template_kwargs=req.chat_template_kwargs,
-    )
+    try:
+        result = backend.generate(
+            plain_msgs,
+            max_new_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            stop=stop,
+            tools=tools_arg,
+            chat_template_kwargs=req.chat_template_kwargs,
+        )
+    except ContextOverflowError as e:
+        # OpenAI-shaped context error (status 400, code context_length_exceeded)
+        # so OpenAI-compatible clients (litellm/Alan-Code) recognise it as a
+        # context overflow and compact/retry, instead of the engine crashing.
+        return JSONResponse(status_code=400, content={"error": {
+            "message": str(e),
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+        }})
+    _log_metrics(req.model, result)
 
-    # Parse tool calls out of the text.
+    # Parse tool calls out of the text. Declared tool names disambiguate a
+    # bare JSON object whose arguments are inlined (no ``arguments`` wrapper).
     parser = get_parser(_TOOL_PARSER_NAME)
-    content, tool_calls = parser(result.text)
+    content, tool_calls = _extract_tool_calls(
+        parser, result.text, tools_arg, req.tool_choice
+    )
 
     message: dict = {"role": "assistant", "content": content}
     finish_reason = result.finish_reason
