@@ -290,6 +290,7 @@ def _coerce_for_template(messages: list[dict]) -> tuple[list[dict], list]:
             continue
         # content is a list of {type: text|image_url, …}
         parts: list[dict] = []
+        has_image = False
         for c in content:
             t = c.get("type")
             if t == "text":
@@ -301,10 +302,19 @@ def _coerce_for_template(messages: list[dict]) -> tuple[list[dict], list]:
                 img = load_image(url)
                 imgs.append(img)
                 parts.append({"type": "image"})
+                has_image = True
             else:
                 warning_once("dropping unsupported content part type %r", t)
                 continue
-        out_msgs.append({"role": role, "content": parts})
+        if has_image:
+            out_msgs.append({"role": role, "content": parts})
+        else:
+            # A text model's chat template concatenates content as a string and
+            # raises on a list of parts; only genuinely multimodal messages need
+            # the list form, so collapse text-only content back to a string.
+            out_msgs.append(
+                {"role": role, "content": "".join(p["text"] for p in parts)}
+            )
     return out_msgs, imgs
 
 
